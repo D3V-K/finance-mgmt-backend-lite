@@ -17,12 +17,16 @@ def get_db_url() -> str:
 
     client = boto3.client("secretsmanager")
 
+    # The RDS-managed secret only holds credentials (username, password) —
+    # host/port/dbname aren't sensitive, so they're passed as plain Lambda
+    # environment variables instead of being duplicated into the secret.
     secret = json.loads(
         client.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"]
     )
     _db_url = (
         f"postgresql+psycopg2://{secret['username']}:{secret['password']}"
-        f"@{secret['host']}:{secret['port']}/{secret['dbname']}"
+        f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
+        f"?sslmode=require"
     )
     return _db_url
 

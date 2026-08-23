@@ -1,7 +1,7 @@
 version = 0.1
 
 [default.global.parameters]
-stack_name = "finance-mgmt-backend-dev"
+stack_name = "finance-mgmt-backend-lite-dev"
 
 [default.build.parameters]
 cached = true
@@ -20,7 +20,7 @@ env_vars = "env.local.json"
 warm_containers = "EAGER"
 
 [prod.global.parameters]
-stack_name = "finance-mgmt-backend-prod"
+stack_name = "finance-mgmt-backend-lite-prod"
 
 [prod.deploy.parameters]
 capabilities = "CAPABILITY_IAM"

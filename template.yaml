@@ -1,12 +1,18 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Finance management backend — FastAPI packaged as a Lambda container image,
-  fronted by an API Gateway HTTP API (v2) with a Cognito JWT authorizer.
+  Finance management backend — cost-optimized for single-digit user counts.
+  FastAPI packaged as a Lambda container image, fronted by an API Gateway
+  HTTP API (v2) with a Cognito JWT authorizer.
 
-  Networking (VPC, subnets, security groups), the Aurora cluster and its
-  Secrets Manager secret, and the Cognito User Pool are provisioned outside
-  this stack and passed in as parameters.
+  Unlike the production-grade version, this stack owns its full database
+  footprint as code: an Aurora Serverless v2 cluster (scale-to-zero) with an
+  RDS-managed Secrets Manager credential. The Lambda function runs outside
+  any VPC, and the database is publicly reachable behind TLS + a generated
+  password — trading network-layer isolation for eliminating the NAT
+  Gateway's flat monthly fee entirely. See README.md for the cost/security
+  tradeoff writeup before reusing this pattern for anything beyond a
+  personal, low-traffic project.
 
 Parameters:
   Environment:
@@ -14,13 +20,6 @@ Parameters:
     Default: dev
     AllowedValues: [dev, staging, prod]
     Description: Deployment environment. Also used as the API Gateway stage name.
-
-  DbSecretArn:
-    Type: String
-    Description: >
-      ARN of the Secrets Manager secret holding the Aurora credentials as JSON
-      (username, password, host, port, dbname). Read once per cold start.
-    AllowedPattern: "^arn:aws[a-zA-Z-]*:secretsmanager:.+$"
 
   CognitoUserPoolId:
     Type: String
@@ -30,18 +29,36 @@ Parameters:
     Type: String
     Description: Cognito App Client ID. Validated as the JWT audience.
 
-  VpcSubnetIds:
-    Type: CommaDelimitedList
-    Default: ""
+  VpcId:
+    Type: AWS::EC2::VPC::Id
     Description: >
-      Private subnet IDs for the Lambda function (must reach Aurora, plus
-      Secrets Manager and ECR via NAT or VPC endpoints). Leave empty to run
-      the function outside a VPC.
+      VPC to place the Aurora cluster's subnet group in. The Lambda function
+      itself does NOT join this VPC — only the database needs it, and RDS
+      always requires a subnet group even for a publicly accessible instance.
+      The account's default VPC works fine here.
 
-  VpcSecurityGroupIds:
-    Type: CommaDelimitedList
-    Default: ""
-    Description: Security group IDs for the Lambda function. Required when VpcSubnetIds is set.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two public subnets (in different AZs) for the DB subnet group,
+      e.g. the default VPC's default subnets. Get them with:
+      aws ec2 describe-subnets --filters Name=vpc-id,Values=<VpcId> Name=default-for-az,Values=true --query "Subnets[].SubnetId"
+
+  DbName:
+    Type: String
+    Default: financedb
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]*$"
+
+  DbMaxCapacityAcu:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 8
+    Description: >
+      Ceiling on Aurora Serverless v2 capacity units (0.5 ACU increments,
+      ~$0.12/ACU-hour). MinCapacity is fixed at 0 below so the cluster scales
+      to zero and stops billing compute during idle periods. Keep this low —
+      single-digit users don't need headroom above 1 ACU (~2 GB RAM).
 
   CorsAllowOrigins:
     Type: CommaDelimitedList
@@ -59,7 +76,10 @@ Parameters:
     Default: 30
     MinValue: 3
     MaxValue: 900
-    Description: Keep at or below the API Gateway HTTP API integration limit of 30s.
+    Description: >
+      Keep at or below the API Gateway HTTP API integration limit of 30s.
+      Note: a cold Aurora resume from zero can take 15-30s by itself, so a
+      request that also cold-starts the Lambda may need most of this budget.
 
   LogRetentionInDays:
     Type: Number
@@ -67,7 +87,6 @@ Parameters:
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
 
 Conditions:
-  IsInVpc: !Not [!Equals [!Join ["", !Ref VpcSubnetIds], ""]]
   IsProd: !Equals [!Ref Environment, prod]
 
 Globals:
@@ -79,13 +98,89 @@ Globals:
     Environment:
       Variables:
         ENVIRONMENT: !Ref Environment
-        DB_SECRET_ARN: !Ref DbSecretArn
+        DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+        DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+        DB_PORT: !GetAtt AuroraCluster.Endpoint.Port
+        DB_NAME: !Ref DbName
         COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
         # Mangum strips this prefix from incoming paths so FastAPI routes
         # match without every route carrying the stage name.
         API_STAGE: !Ref Environment
 
 Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub Public subnets for ${AWS::StackName} Aurora cluster
+      SubnetIds: !Ref PublicSubnetIds
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Allow Postgres to ${AWS::StackName} Aurora cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # The Lambda function runs outside a VPC and has no stable source IP,
+        # so this can't be scoped tighter without reintroducing a NAT Gateway
+        # or a VPC-attached Lambda. Exposure is mitigated by TLS-only
+        # connections (rds.force_ssl) and an RDS-managed, non-reused password.
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+          Description: Postgres from anywhere (auth + TLS enforced at the DB)
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: Force TLS on all connections
+      Family: aurora-postgresql16
+      Parameters:
+        rds.force_ssl: "1"
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      # Scale-to-zero requires a recent Aurora PostgreSQL minor version.
+      # Verify this still meets the current minimum in AWS's docs before
+      # deploying — the requirement has moved as the feature has matured.
+      EngineVersion: "16.6"
+      DatabaseName: !Ref DbName
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBClusterParameterGroupName: !Ref DbParameterGroup
+      VpcSecurityGroupIds:
+        - !GetAtt DbSecurityGroup.GroupId
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0
+        MaxCapacity: !Ref DbMaxCapacityAcu
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: finance-mgmt-backend-lite
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      PubliclyAccessible: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: finance-mgmt-backend-lite
+
   HttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
@@ -110,7 +205,7 @@ Resources:
           {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","userSub":"$context.authorizer.claims.sub"}
       Tags:
         Environment: !Ref Environment
-        Application: finance-mgmt-backend
+        Application: finance-mgmt-backend-lite
 
   ApiFunction:
     Type: AWS::Serverless::Function
@@ -122,17 +217,13 @@ Resources:
         # Mirrors the Dockerfile CMD; kept here so the entrypoint is visible
         # in the stack rather than only baked into the image.
         Command: ["src.main.handler"]
-      VpcConfig: !If
-        - IsInVpc
-        - SubnetIds: !Ref VpcSubnetIds
-          SecurityGroupIds: !Ref VpcSecurityGroupIds
-        - !Ref AWS::NoValue
+      # Deliberately not VPC-attached: no VPC means no NAT Gateway / VPC
+      # endpoint is needed to reach Secrets Manager or ECR, which is the
+      # single biggest fixed cost this fork removes. The tradeoff is that
+      # the Aurora cluster above must be publicly reachable instead.
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref DbSecretArn
-        # Attached unconditionally: SAM flattens Fn::If inside Policies, and the
-        # ENI permissions are inert when the function runs outside a VPC.
-        - VPCAccessPolicy: {}
+            SecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
       Events:
         # Public — used by uptime checks and to warm the function.
         HealthCheck:
@@ -157,7 +248,7 @@ Resources:
             Method: ANY
       Tags:
         Environment: !Ref Environment
-        Application: finance-mgmt-backend
+        Application: finance-mgmt-backend-lite
     Metadata:
       DockerContext: .
       Dockerfile: Dockerfile
@@ -227,3 +318,11 @@ Outputs:
   LogGroupName:
     Description: CloudWatch log group for the function.
     Value: !Ref ApiFunctionLogGroup
+
+  AuroraClusterEndpoint:
+    Description: Aurora cluster write endpoint.
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+
+  DbSecretArn:
+    Description: ARN of the RDS-managed Secrets Manager credential (username + password only).
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn

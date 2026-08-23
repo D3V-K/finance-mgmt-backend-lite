@@ -1,12 +1,15 @@
-# Finance App — Python Backend
+# Finance App — Python Backend (Lite)
 
-A serverless REST API for the personal finance management application, built with FastAPI and deployed as a container image on AWS Lambda. Sits behind API Gateway HTTP API (v2) with Cognito JWT authorization, and reads/writes to an Aurora Serverless v2 PostgreSQL database inside a private VPC.
+A serverless REST API for the personal finance management application, built with FastAPI and deployed as a container image on AWS Lambda. Sits behind API Gateway HTTP API (v2) with Cognito JWT authorization, and reads/writes to an Aurora Serverless v2 PostgreSQL database.
+
+This is a **cost-optimized fork** of [`finance-mgmt-backend`](https://github.com/D3V-K/finance-mgmt-backend), rebuilt for single-digit real-world users rather than as a portfolio piece. The application code is unchanged; what's different is the AWS footprint — see [Cost & Architecture Tradeoffs](#cost--architecture-tradeoffs) for what changed and why.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Cost & Architecture Tradeoffs](#cost--architecture-tradeoffs)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
@@ -23,15 +26,45 @@ A serverless REST API for the personal finance management application, built wit
 
 ## Overview
 
-The backend is a FastAPI application wrapped with Mangum to run as an AWS Lambda function. It is packaged as a Docker container image (rather than a zip artifact) to accommodate the combined size of FastAPI, SQLAlchemy, and psycopg2 binary dependencies. All database credentials are retrieved at cold-start from AWS Secrets Manager — nothing sensitive lives in environment variables or the container image.
+The backend is a FastAPI application wrapped with Mangum to run as an AWS Lambda function. It is packaged as a Docker container image (rather than a zip artifact) to accommodate the combined size of FastAPI, SQLAlchemy, and psycopg2 binary dependencies.
 
 ```
 API Gateway HTTP API (v2)
   └── Cognito JWT Authorizer (validates Bearer token)
-        └── Lambda Function (FastAPI + Mangum, container image)
-              ├── Aurora Serverless v2 PostgreSQL (private subnet)
-              └── Secrets Manager (DB credentials at cold-start)
+        └── Lambda Function (FastAPI + Mangum, container image, no VPC)
+              ├── Aurora Serverless v2 PostgreSQL (public endpoint, TLS-only, scale-to-zero)
+              └── Secrets Manager (RDS-managed credential, read at cold-start)
 ```
+
+---
+
+## Cost & Architecture Tradeoffs
+
+The production-grade version of this backend puts the Lambda function and Aurora cluster inside a private VPC, reachable only from each other, with a NAT Gateway so the Lambda can still call Secrets Manager and ECR. That's the right call for a real multi-tenant product. It's the wrong call for a single-digit-user personal project: **the NAT Gateway and the Aurora minimum-capacity floor are both flat monthly fees that don't scale down with traffic** — you pay them at 3am with zero requests just the same as you would serving real load.
+
+| Cost driver | Production-grade version | This fork | Approx. monthly savings |
+|---|---|---|---|
+| NAT Gateway | ~$32 flat + ~$0.045/GB processed | Removed — Lambda isn't VPC-attached | ~$32-40 |
+| Aurora compute floor | 0.5 ACU minimum, always on (~$40-45) | `MinCapacity: 0` — scales to zero, pays only for active ACU-hours | ~$35-45 (workload-dependent) |
+| VPC endpoints | N/A (used NAT instead) | Not needed (no VPC) | — |
+| **Estimated baseline (idle)** | **~$75-90/mo before any traffic** | **~$1-3/mo (storage + backups) plus a few cents of compute per active session** | **~90%** |
+
+### What actually changed
+
+- **Aurora Serverless v2 scales to zero.** `ServerlessV2ScalingConfiguration.MinCapacity` is `0` instead of `0.5`. The cluster pauses after a period of inactivity and resumes on the next connection — at the cost of a cold resume delay (see below). `MaxCapacity` defaults to 1 ACU (~2 GB RAM), which is more than enough headroom for a handful of users; the original's ceiling of 4 ACU was sized for load this project will never see.
+- **The Lambda function isn't in a VPC at all.** It was only ever in one to reach Aurora privately and to route Secrets Manager/ECR calls through the NAT Gateway. Removing the VPC attachment removes the NAT dependency entirely, and Lambda cold starts are faster without ENI attachment overhead as a bonus.
+- **Aurora is publicly accessible instead.** Since Lambda no longer has a private network path to reach it, the database needs a public endpoint. This is the real tradeoff: the DB port is technically internet-reachable. It's mitigated three ways — `rds.force_ssl` is enforced at the cluster parameter group (plaintext connections are rejected), the master password is RDS-managed via `ManageMasterUserPassword` (a long random value in Secrets Manager, never hand-set, easy to rotate), and the security group only opens 5432 (not the whole instance). This is a reasonable bar for a low-value personal finance dataset with single-digit users; it is **not** the bar to hold for a multi-tenant product handling other people's money — that's what the production-grade fork is for.
+- **The Secrets Manager credential shape changed.** `ManageMasterUserPassword` gives you a secret containing only `{"username", "password"}` — RDS manages it, and AWS can auto-rotate it. Host, port, and database name aren't secrets, so they're passed as plain Lambda environment variables (`DB_HOST`, `DB_PORT`, `DB_NAME`) instead of being duplicated into the secret's JSON. `src/db.py` reads credentials from Secrets Manager and connection details from the environment, and always connects with `sslmode=require`.
+- **No manually-provisioned infrastructure.** The production-grade version treats the VPC, NAT, and Aurora cluster as provisioned outside the SAM stack (by hand, or by a separate process) and passed in as parameters. This fork's `template.yaml` owns the Aurora cluster, subnet group, security group, and parameter group directly — `sam deploy` is the only step needed to stand up the whole thing from nothing but a VPC ID and two subnet IDs (the account's default VPC works fine).
+
+### The cold-start tradeoff
+
+Because Aurora can scale all the way to zero, the first request after a period of inactivity pays two cold starts back to back: the Lambda's own cold start (roughly 1-2s for this image size) plus Aurora resuming from paused (commonly 15-30s, per AWS). For a single-digit-user app where "first request of the day" is a normal pattern, this means an occasional slow request rather than a broken one — `LambdaTimeout` is left at 30s to give the resume room to finish, and this is the one place where "cost-optimized" and "always snappy" are directly in tension. If that resume latency becomes annoying in practice, the fix is a one-line change: bump `DbMaxCapacityAcu`'s floor by setting `MinCapacity: 0.5` instead of `0`, which brings back a small always-on cost (~$40-45/mo) in exchange for eliminating the pause entirely — a deliberate knob, not a rewrite.
+
+### When to use which fork
+
+- Use **this fork** for actually running the app for yourself or a handful of people, where minimizing AWS spend matters more than defense-in-depth network isolation.
+- Use the [production-grade version](https://github.com/D3V-K/finance-mgmt-backend) as the reference architecture for a portfolio, for learning VPC/NAT/private-Aurora patterns, or as the starting point if this app ever needs to serve untrusted multi-tenant traffic.
 
 ---
 
@@ -43,21 +76,19 @@ The function is packaged as a Docker container image stored in Amazon ECR. This 
 
 The Lambda handler entry point is the `Mangum` adapter in `src/main.py`. Mangum translates the API Gateway event format into a standard ASGI request that FastAPI can process, and translates the FastAPI response back into the format API Gateway expects.
 
-### VPC Placement
+### No VPC
 
-The Lambda function runs inside a private VPC alongside the Aurora cluster. This is a requirement for Aurora Serverless v2 — it does not have a public endpoint. The function is placed in private subnets with a NAT Gateway providing outbound internet access for calls to Secrets Manager and ECR during cold starts.
+The Lambda function does **not** join a VPC. It reaches Secrets Manager, ECR, and the Aurora cluster's public endpoint directly over the internet via AWS's managed networking — no NAT Gateway or VPC interface endpoint required. See [Cost & Architecture Tradeoffs](#cost--architecture-tradeoffs) for what this trades away.
 
-The security group on the Lambda function allows only outbound traffic. The security group on the Aurora cluster allows inbound PostgreSQL (port 5432) only from the Lambda security group — no broader access.
+### Aurora Serverless v2 (scale-to-zero)
 
-### Aurora Serverless v2
-
-The database is Aurora PostgreSQL Serverless v2. It scales from 0.5 ACUs (Aurora Capacity Units) up to 4 ACUs based on load, and can pause after a period of inactivity. For a personal-use application this means near-zero database cost during idle periods, at the cost of a ~20–30 second cold-start delay when the cluster resumes from pause.
+The database is Aurora PostgreSQL Serverless v2 with `MinCapacity: 0`, so it pauses to zero ACUs (and zero compute cost) after a period of inactivity and resumes on the next connection, at the cost of a cold-start delay of roughly 15-30 seconds. `MaxCapacity` defaults to 1 ACU — sized for single-digit concurrent users, not for headroom.
 
 A `NullPool` SQLAlchemy connection pool is used instead of the default pool. Lambda execution contexts are ephemeral and do not persist between invocations reliably, so a persistent connection pool would leak connections to Aurora. `NullPool` opens a fresh connection per request and closes it immediately after — the correct pattern for Lambda.
 
 ### Secrets Manager
 
-Database credentials (host, port, username, password, database name) are stored as a single JSON secret in AWS Secrets Manager. The Lambda function retrieves and parses this secret once per cold start and caches the resulting database URL in the module scope. Subsequent warm invocations reuse the cached URL without calling Secrets Manager again, keeping latency low.
+RDS manages the master credential directly (`ManageMasterUserPassword: true`) — the resulting secret holds only `username` and `password`, and AWS can rotate it without any code changes. Host, port, and database name are passed as plain Lambda environment variables since they aren't sensitive. The Lambda function reads both once per cold start and caches the resulting database URL in module scope; warm invocations reuse it without another Secrets Manager call.
 
 ---
 
@@ -106,7 +137,7 @@ backend/
 ├── requirements.dev.txt         # Dev + test dependencies
 ├── alembic.ini                  # Alembic migration config
 ├── docker-compose.dev.yaml      # Local PostgreSQL for development
-├── template.yaml                # AWS SAM template (Lambda + HTTP API + auth)
+├── template.yaml                # AWS SAM template (Lambda + HTTP API + auth + Aurora)
 ├── samconfig.toml               # Saved sam build/deploy/local settings per env
 └── env.local.example.json       # Template for sam local environment variables
 ```
@@ -126,7 +157,7 @@ backend/
 | AWS SDK | boto3 | Secrets Manager access, any future AWS service calls |
 | Testing | pytest + httpx | Async test client for FastAPI endpoints |
 | Packaging | Docker + ECR | Container image deployment to Lambda |
-| IaC | AWS SAM | Lambda, API Gateway, IAM and log group provisioning |
+| IaC | AWS SAM | Lambda, API Gateway, IAM, Aurora, and log group provisioning |
 
 ---
 
@@ -166,7 +197,7 @@ All data queries are scoped to the authenticated user's ID — there is no admin
 
 ### Connection Setup
 
-The database URL is constructed once at module load time (cold start) from credentials retrieved via Secrets Manager. SQLAlchemy uses `NullPool` to avoid connection leaks across Lambda invocations.
+The database URL is constructed once at module load time (cold start): credentials come from the RDS-managed Secrets Manager secret, host/port/dbname come from plain environment variables, and the connection is forced over TLS. SQLAlchemy uses `NullPool` to avoid connection leaks across Lambda invocations.
 
 ```python
 # db.py
@@ -177,21 +208,28 @@ from sqlalchemy.pool import NullPool
 
 _db_url: str | None = None
 
-def _get_db_url() -> str:
+def get_db_url() -> str:
     global _db_url
     if _db_url:
         return _db_url
+
+    dev_db_url = os.getenv("DATABASE_URL")
+    if dev_db_url:
+        _db_url = dev_db_url
+        return _db_url
+
     client = boto3.client("secretsmanager")
     secret = json.loads(
         client.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"]
     )
     _db_url = (
         f"postgresql+psycopg2://{secret['username']}:{secret['password']}"
-        f"@{secret['host']}:{secret['port']}/{secret['dbname']}"
+        f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
+        f"?sslmode=require"
     )
     return _db_url
 
-engine = create_engine(_get_db_url(), poolclass=NullPool)
+engine = create_engine(get_db_url(), poolclass=NullPool)
 SessionLocal = sessionmaker(bind=engine)
 
 def get_db():
@@ -229,7 +267,7 @@ class Category(Base):
 
 ### Migrations
 
-Database schema changes are managed with Alembic. Migrations run from a developer machine or a one-off Lambda invocation — they do not run automatically on deployment.
+Database schema changes are managed with Alembic. Migrations run from a developer machine or a one-off Lambda invocation — they do not run automatically on deployment. Point `DATABASE_URL` at the Aurora cluster's public endpoint (see [Outputs](#deploying)) to run them from a laptop; no VPN or bastion is needed since the cluster is publicly reachable.
 
 ```bash
 # Create a new migration after changing a model
@@ -285,7 +323,10 @@ Full OpenAPI documentation is auto-generated by FastAPI and available at `/docs`
 The Lambda function reads the following environment variables at runtime. These are set in the SAM template and never committed to the repository.
 
 ```bash
-DB_SECRET_ARN=arn:aws:secretsmanager:ap-northeast-1:123456789:secret:finance/db-credentials
+DB_SECRET_ARN=arn:aws:secretsmanager:ap-northeast-1:123456789:secret:finance-lite/aurora-master-...
+DB_HOST=finance-lite-dev-auroracluster-xxxxx.cluster-xxxxx.ap-northeast-1.rds.amazonaws.com
+DB_PORT=5432
+DB_NAME=financedb
 COGNITO_USER_POOL_ID=ap-northeast-1_XXXXXXXXX
 ENVIRONMENT=prod    # used to toggle debug logging
 API_STAGE=prod      # stage prefix Mangum strips from incoming paths
@@ -293,7 +334,7 @@ API_STAGE=prod      # stage prefix Mangum strips from incoming paths
 
 `AWS_REGION` is set by the Lambda runtime itself and is reserved — it cannot be assigned in the template.
 
-For local development, create a `.env` file at the project root and load it with `python-dotenv`. When running locally, set `DATABASE_URL` to point straight at a local PostgreSQL instance; `db.py` prefers it and never calls Secrets Manager. Leaving `DATABASE_URL` unset makes it fall back to `DB_SECRET_ARN`, which requires real AWS credentials.
+For local development, create a `.env` file at the project root and load it with `python-dotenv`. When running locally, set `DATABASE_URL` to point straight at a local PostgreSQL instance; `db.py` prefers it and never calls Secrets Manager. Leaving `DATABASE_URL` unset makes it fall back to `DB_SECRET_ARN` (plus `DB_HOST`/`DB_PORT`/`DB_NAME`), which requires real AWS credentials.
 
 ---
 
@@ -330,7 +371,7 @@ sam local start-api --env-vars env.local.json
 # → http://localhost:3000
 ```
 
-`env.local.json` supplies environment variables to the local Lambda invocation and can point `DB_SECRET_ARN` at a real secret or override the database URL for a local instance. Copy `env.local.example.json` to `env.local.json` to get started — it is gitignored, and `samconfig.toml` already points `sam local start-api` at it.
+`env.local.json` supplies environment variables to the local Lambda invocation and can point `DB_SECRET_ARN`/`DB_HOST`/`DB_PORT`/`DB_NAME` at a real deployed cluster or override `DATABASE_URL` for a local instance. Copy `env.local.example.json` to `env.local.json` to get started — it is gitignored, and `samconfig.toml` already points `sam local start-api` at it.
 
 ### Running Tests
 
@@ -351,22 +392,32 @@ Tests use an in-memory SQLite database via a pytest fixture in `conftest.py` and
 
 ## Building and Deployment
 
-`template.yaml` provisions the application stack only: the Lambda function (container image), the HTTP API with its Cognito JWT authorizer, the execution role, log groups, and — in `prod` — an error alarm. The VPC, the Aurora cluster with its Secrets Manager secret, and the Cognito User Pool are provisioned separately and passed in as stack parameters.
+`template.yaml` provisions the **entire** stack, including the database: the Lambda function (container image, no VPC), the HTTP API with its Cognito JWT authorizer, the Aurora Serverless v2 cluster with its subnet group, security group, and RDS-managed Secrets Manager credential, the execution role, log groups, and — in `prod` — an error alarm. Only the Cognito User Pool and a VPC to hang the DB subnet group off of (the account's default VPC is fine) are provisioned outside this stack.
 
 ### Stack parameters
 
 | Parameter | Required | Default | Notes |
 |---|---|---|---|
 | `Environment` | no | `dev` | One of `dev`, `staging`, `prod`. Also the API Gateway stage name. |
-| `DbSecretArn` | **yes** | — | Secrets Manager ARN for the Aurora credentials JSON. |
 | `CognitoUserPoolId` | **yes** | — | Builds the JWT issuer URL. |
 | `CognitoUserPoolClientId` | **yes** | — | Validated as the JWT audience. |
-| `VpcSubnetIds` | no | *(empty)* | Private subnet IDs. Empty runs the function outside a VPC. |
-| `VpcSecurityGroupIds` | no | *(empty)* | Required when `VpcSubnetIds` is set. |
+| `VpcId` | **yes** | — | VPC for the Aurora subnet group. The default VPC works. |
+| `PublicSubnetIds` | **yes** | — | At least two public subnets in different AZs. See command below. |
+| `DbName` | no | `financedb` | |
+| `DbMaxCapacityAcu` | no | `1` | Aurora Serverless v2 ceiling. `MinCapacity` is fixed at `0` (scale-to-zero) in the template. |
 | `CorsAllowOrigins` | no | `*` | Set to the frontend origin in `prod`. |
 | `LambdaMemorySize` | no | `512` | |
-| `LambdaTimeout` | no | `30` | Capped by the HTTP API integration limit. |
+| `LambdaTimeout` | no | `30` | Capped by the HTTP API integration limit; also needs headroom for an Aurora cold resume. |
 | `LogRetentionInDays` | no | `14` | Applies to both the function and access log groups. |
+
+Find your default VPC's public subnet IDs:
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values=$VPC_ID Name=default-for-az,Values=true \
+  --query "Subnets[].SubnetId" --output text
+```
 
 ### Deploying
 
@@ -378,18 +429,19 @@ sam build
 sam deploy --guided \
   --parameter-overrides \
     Environment=dev \
-    DbSecretArn=arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:finance/db-credentials \
     CognitoUserPoolId=ap-northeast-1_XXXXXXXXX \
     CognitoUserPoolClientId=XXXXXXXXXXXXXXXXXXXXXXXXXX \
-    VpcSubnetIds=subnet-aaa,subnet-bbb \
-    VpcSecurityGroupIds=sg-ccc
+    VpcId=vpc-xxxxxxxx \
+    PublicSubnetIds=subnet-aaa,subnet-bbb
 
 # Subsequent deploys reuse the saved parameters in samconfig.toml
 sam deploy                    # dev
 sam deploy --config-env prod  # prod
 ```
 
-`sam deploy` publishes the container image to ECR, updates the Lambda function, and applies any CloudFormation stack changes (API Gateway routes, IAM roles, VPC config). `resolve_image_repos = true` in `samconfig.toml` means SAM creates and reuses a managed ECR repository — no ECR repository needs to be created by hand.
+`sam deploy` publishes the container image to ECR, updates the Lambda function, and applies any CloudFormation stack changes — including, on the very first deploy, standing up the Aurora cluster itself. Expect the first deploy to take several minutes longer than subsequent ones while Aurora provisions. `resolve_image_repos = true` in `samconfig.toml` means SAM creates and reuses a managed ECR repository — no ECR repository needs to be created by hand.
+
+After deploying, the stack outputs `AuroraClusterEndpoint` and `DbSecretArn` — useful for pointing Alembic or a local client at the live database.
 
 ### Routing and the stage prefix
 
@@ -403,28 +455,11 @@ Three routes are registered against the HTTP API:
 
 Because the stage is named after `Environment`, every request path arrives prefixed (e.g. `/dev/transactions`). The stack passes that prefix to the function as `API_STAGE`, and `main.py` hands it to Mangum as `api_gateway_base_path` so FastAPI routes match without carrying the stage name. Locally `API_STAGE` is unset, so nothing is stripped.
 
-To deploy manually without SAM:
-
-```bash
-# Build and push the image to ECR
-aws ecr get-login-password --region ap-northeast-1 | \
-  docker login --username AWS --password-stdin $ECR_URI
-
-docker build -t finance-api .
-docker tag finance-api:latest $ECR_URI/finance-api:latest
-docker push $ECR_URI/finance-api:latest
-
-# Update the Lambda function to use the new image
-aws lambda update-function-code \
-  --function-name FinanceAPI \
-  --image-uri $ECR_URI/finance-api:latest
-```
-
 ---
 
 ## CI/CD Pipeline
 
-Backend deployment is automated via GitHub Actions on every push to `main` that touches files in the `backend/` directory.
+Backend deployment is automated via GitHub Actions on every push to `main`.
 
 ```yaml
 # .github/workflows/deploy-backend.yml
@@ -433,7 +468,6 @@ name: Deploy backend
 on:
   push:
     branches: [main]
-    paths: ['backend/**']
 
 jobs:
   test:
@@ -473,12 +507,13 @@ jobs:
             --image-repository ${{ secrets.ECR_URI }} \
             --parameter-overrides \
               Environment=prod \
-              DbSecretArn=${{ secrets.DB_SECRET_ARN }} \
               CognitoUserPoolId=${{ secrets.COGNITO_USER_POOL_ID }} \
               CognitoUserPoolClientId=${{ secrets.COGNITO_CLIENT_ID }} \
-              VpcSubnetIds=${{ secrets.VPC_SUBNET_IDS }} \
-              VpcSecurityGroupIds=${{ secrets.VPC_SECURITY_GROUP_IDS }}
+              VpcId=${{ secrets.VPC_ID }} \
+              PublicSubnetIds=${{ secrets.PUBLIC_SUBNET_IDS }}
 ```
+
+Required repo secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `ECR_URI`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `VPC_ID`, `PUBLIC_SUBNET_IDS`.
 
 `sam build` builds the image from the `Dockerfile` declared in the function's `Metadata` and `sam deploy` pushes it to ECR — a separate `docker build`/`docker push` step is not needed, and there is no `ImageUri` parameter to override.
 
@@ -488,7 +523,7 @@ The `deploy` job only runs if the `test` job passes, enforcing a minimum 80% tes
 
 ## Observability
 
-All Lambda invocations automatically emit logs to CloudWatch Logs under the log group `/aws/lambda/FinanceAPI`. Structured JSON logging is used so log entries can be queried and filtered in CloudWatch Insights.
+All Lambda invocations automatically emit logs to CloudWatch Logs under the log group `/aws/lambda/<stack-name>-api`. Structured JSON logging is used so log entries can be queried and filtered in CloudWatch Insights.
 
 ```python
 # Structured logging setup in main.py
@@ -530,4 +565,5 @@ Lambda function metrics (invocation count, error rate, duration, throttles) are 
 
 ## Related
 
+- [`finance-mgmt-backend`](https://github.com/D3V-K/finance-mgmt-backend) — the production-grade version this was forked from (private VPC, NAT Gateway, always-on Aurora floor)
 - [`/frontend`](../frontend/README.md) — React + Vite frontend
