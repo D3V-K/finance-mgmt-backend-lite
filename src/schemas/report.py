@@ -19,3 +19,9 @@ class CategoryReport(BaseModel):
 class NetWorthPoint(BaseModel):
     month: date
     net_worth: int
+
+
+class AccountBalance(BaseModel):
+    cash_balance: int
+    bank_balance: int
+    total_balance: int

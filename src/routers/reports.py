@@ -7,9 +7,12 @@ from sqlalchemy.orm import Session
 from ..dependencies import get_current_user
 from ..db import get_db
 from ..models.category import Category, CategoryType
+from ..models.enums import AccountType
+from ..models.opening_balance import AccountOpeningBalance
 from ..models.transaction import Transaction
+from ..models.transfer import Transfer
 from ..models.user import User
-from ..schemas.report import CategoryReport, MonthlyReport, NetWorthPoint
+from ..schemas.report import AccountBalance, CategoryReport, MonthlyReport, NetWorthPoint
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -109,3 +112,65 @@ def net_worth_report(
     rows = query.order_by(outer.c.month).all()
 
     return [NetWorthPoint(month=row.month.date(), net_worth=int(row.net_worth)) for row in rows]
+
+
+@router.get("/balance", response_model=AccountBalance)
+def balance_report(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    balances = {AccountType.CASH: 0, AccountType.BANK: 0}
+
+    opening_rows = (
+        db.query(
+            AccountOpeningBalance.account_type,
+            func.sum(AccountOpeningBalance.amount),
+        )
+        .filter(AccountOpeningBalance.user_id == user.id)
+        .group_by(AccountOpeningBalance.account_type)
+        .all()
+    )
+    for account_type, amount in opening_rows:
+        balances[account_type] += int(amount or 0)
+
+    signed_amount = func.sum(
+        case(
+            (Category.type == CategoryType.INCOME, Transaction.amount),
+            else_=-Transaction.amount,
+        )
+    )
+    transaction_rows = (
+        db.query(Transaction.account_type, signed_amount)
+        .join(Category, Transaction.category_id == Category.id)
+        .filter(Transaction.user_id == user.id)
+        .group_by(Transaction.account_type)
+        .all()
+    )
+    for account_type, amount in transaction_rows:
+        balances[account_type] += int(amount or 0)
+
+    incoming_rows = (
+        db.query(Transfer.to_account, func.sum(Transfer.amount))
+        .filter(Transfer.user_id == user.id)
+        .group_by(Transfer.to_account)
+        .all()
+    )
+    for account_type, amount in incoming_rows:
+        balances[account_type] += int(amount or 0)
+
+    outgoing_rows = (
+        db.query(Transfer.from_account, func.sum(Transfer.amount))
+        .filter(Transfer.user_id == user.id)
+        .group_by(Transfer.from_account)
+        .all()
+    )
+    for account_type, amount in outgoing_rows:
+        balances[account_type] -= int(amount or 0)
+
+    cash_balance = balances[AccountType.CASH]
+    bank_balance = balances[AccountType.BANK]
+    return AccountBalance(
+        cash_balance=cash_balance,
+        bank_balance=bank_balance,
+        total_balance=cash_balance + bank_balance,
+    )
