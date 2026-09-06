@@ -11,7 +11,12 @@ def create_category(client, **overrides):
 
 
 def create_transaction(client, category_id, **overrides):
-    payload = {"amount": 100, "category_id": category_id, "transaction_date": "2024-01-15"}
+    payload = {
+        "amount": 100,
+        "category_id": category_id,
+        "account_type": "cash",
+        "transaction_date": "2024-01-15",
+    }
     payload.update(overrides)
     resp = client.post("/transactions", json=payload)
     assert resp.status_code == 201, resp.text
@@ -26,15 +31,40 @@ def test_create_transaction(client):
     assert body["amount"] == 1234
     assert body["description"] == "Groceries"
     assert body["category_id"] == category["id"]
+    assert body["account_type"] == "cash"
     assert body["transaction_date"] == "2024-01-15"
     uuid.UUID(body["id"])
     uuid.UUID(body["user_id"])
 
 
+def test_create_transaction_persists_account_type(client):
+    category = create_category(client)
+
+    body = create_transaction(client, category["id"], account_type="bank")
+
+    assert body["account_type"] == "bank"
+
+
+def test_create_transaction_requires_account_type(client):
+    category = create_category(client)
+
+    resp = client.post(
+        "/transactions",
+        json={"amount": 100, "category_id": category["id"], "transaction_date": "2024-01-15"},
+    )
+
+    assert resp.status_code == 422
+
+
 def test_create_transaction_invalid_category(client):
     resp = client.post(
         "/transactions",
-        json={"amount": 100, "category_id": str(uuid.uuid4()), "transaction_date": "2024-01-15"},
+        json={
+            "amount": 100,
+            "category_id": str(uuid.uuid4()),
+            "account_type": "cash",
+            "transaction_date": "2024-01-15",
+        },
     )
 
     assert resp.status_code == 400
@@ -49,7 +79,12 @@ def test_create_transaction_category_owned_by_other_user(client, db_session, oth
 
     resp = client.post(
         "/transactions",
-        json={"amount": 100, "category_id": str(other_category.id), "transaction_date": "2024-01-15"},
+        json={
+            "amount": 100,
+            "category_id": str(other_category.id),
+            "account_type": "cash",
+            "transaction_date": "2024-01-15",
+        },
     )
 
     assert resp.status_code == 400
@@ -73,6 +108,7 @@ def test_get_transaction_not_found(client):
 
 def test_get_transaction_owned_by_other_user_not_found(client, db_session, other_user):
     from src.models.category import Category, CategoryType
+    from src.models.enums import AccountType
     from src.models.transaction import Transaction
 
     other_category = Category(id=uuid.uuid4(), name="Other's", user_id=other_user.id, type=CategoryType.EXPENSE)
@@ -82,6 +118,7 @@ def test_get_transaction_owned_by_other_user_not_found(client, db_session, other
         id=uuid.uuid4(),
         amount=100,
         category_id=other_category.id,
+        account_type=AccountType.CASH,
         user_id=other_user.id,
         transaction_date=date(2024, 1, 1),
     )
@@ -150,6 +187,7 @@ def test_list_transactions_filter_by_category(client):
 
 def test_list_transactions_is_user_scoped(client, db_session, other_user):
     from src.models.category import Category, CategoryType
+    from src.models.enums import AccountType
     from src.models.transaction import Transaction
 
     other_category = Category(id=uuid.uuid4(), name="Other's", user_id=other_user.id, type=CategoryType.EXPENSE)
@@ -160,6 +198,7 @@ def test_list_transactions_is_user_scoped(client, db_session, other_user):
             id=uuid.uuid4(),
             amount=999,
             category_id=other_category.id,
+            account_type=AccountType.CASH,
             user_id=other_user.id,
             transaction_date=date(2024, 1, 1),
         )
@@ -197,6 +236,25 @@ def test_update_transaction_category(client):
 
     assert resp.status_code == 200
     assert resp.json()["category_id"] == category_b["id"]
+
+
+def test_update_transaction_account_type(client):
+    category = create_category(client)
+    transaction = create_transaction(client, category["id"], account_type="cash")
+
+    resp = client.put(f"/transactions/{transaction['id']}", json={"account_type": "bank"})
+
+    assert resp.status_code == 200
+    assert resp.json()["account_type"] == "bank"
+
+
+def test_update_transaction_rejects_explicit_null_account_type(client):
+    category = create_category(client)
+    transaction = create_transaction(client, category["id"])
+
+    resp = client.put(f"/transactions/{transaction['id']}", json={"account_type": None})
+
+    assert resp.status_code == 422
 
 
 def test_update_transaction_invalid_category(client):

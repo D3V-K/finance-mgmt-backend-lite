@@ -11,7 +11,12 @@ def create_category(client, **overrides):
 
 
 def create_transaction(client, category_id, **overrides):
-    payload = {"amount": 100, "category_id": category_id, "transaction_date": "2024-01-15"}
+    payload = {
+        "amount": 100,
+        "category_id": category_id,
+        "account_type": "cash",
+        "transaction_date": "2024-01-15",
+    }
     payload.update(overrides)
     resp = client.post("/transactions", json=payload)
     assert resp.status_code == 201, resp.text
@@ -65,6 +70,7 @@ def test_monthly_report_date_range_filter(client):
 
 def test_monthly_report_is_user_scoped(client, db_session, other_user):
     from src.models.category import Category, CategoryType
+    from src.models.enums import AccountType
     from src.models.transaction import Transaction
 
     other_category = Category(id=uuid.uuid4(), name="Other's", user_id=other_user.id, type=CategoryType.INCOME)
@@ -75,6 +81,7 @@ def test_monthly_report_is_user_scoped(client, db_session, other_user):
             id=uuid.uuid4(),
             amount=9999,
             category_id=other_category.id,
+            account_type=AccountType.CASH,
             user_id=other_user.id,
             transaction_date=date(2024, 1, 1),
         )

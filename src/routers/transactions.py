@@ -73,6 +73,7 @@ def create_transaction(
         amount=payload.amount,
         description=payload.description,
         category_id=payload.category_id,
+        account_type=payload.account_type,
         transaction_date=payload.transaction_date,
         user_id=user.id,
     )

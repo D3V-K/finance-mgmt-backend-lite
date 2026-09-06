@@ -207,7 +207,12 @@ def test_delete_category_cascades_to_transactions(client):
     category = create_category(client, name="Food")
     tx_resp = client.post(
         "/transactions",
-        json={"amount": 500, "category_id": category["id"], "transaction_date": "2024-01-01"},
+        json={
+            "amount": 500,
+            "category_id": category["id"],
+            "account_type": "cash",
+            "transaction_date": "2024-01-01",
+        },
     )
     assert tx_resp.status_code == 201
 
