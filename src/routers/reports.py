@@ -82,12 +82,29 @@ def by_category_report(
 
 
 @router.get("/net-worth", response_model=list[NetWorthPoint])
+@router.get("/net-balance", response_model=list[NetWorthPoint])
 def net_worth_report(
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Cumulative **net balance** over time, one point per month with activity.
+
+    This is distinct from *net cashflow*:
+
+    - *net cashflow* (``/reports/monthly``) = income − expense within a period.
+      It is a flow: it never sees opening balances or transfers.
+    - *net balance* (``/reports/net-worth`` = ``/reports/net-balance``) = total
+      funds held at a point in time = the user's total opening balance
+      (CASH + BANK) plus the cumulative net cashflow up to and including that
+      month.
+
+    The cumulative running total spans all history regardless of ``from``/``to``;
+    those params only window which months are returned, so each point stays a
+    true point-in-time balance. A user with no transactions has no month rows to
+    anchor to and gets ``[]`` even when opening balances are set.
+    """
     month = func.date_trunc("month", Transaction.transaction_date, type_=DateTime).label("month")
     net = func.sum(
         case(
@@ -111,7 +128,17 @@ def net_worth_report(
     query = _apply_date_range(query, outer.c.month, from_, to)
     rows = query.order_by(outer.c.month).all()
 
-    return [NetWorthPoint(month=row.month.date(), net_worth=int(row.net_worth)) for row in rows]
+    opening_total = int(
+        db.query(func.coalesce(func.sum(AccountOpeningBalance.amount), 0))
+        .filter(AccountOpeningBalance.user_id == user.id)
+        .scalar()
+        or 0
+    )
+
+    return [
+        NetWorthPoint(month=row.month.date(), net_worth=int(row.net_worth) + opening_total)
+        for row in rows
+    ]
 
 
 @router.get("/balance", response_model=AccountBalance)
