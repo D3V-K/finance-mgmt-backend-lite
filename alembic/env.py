@@ -1,3 +1,4 @@
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
@@ -8,6 +9,25 @@ from src.models import Base
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+
+
+def _database_url() -> str:
+    """Resolve the target database URL at runtime.
+
+    Prefers DATABASE_URL (set by CI and local dev), then the same Secrets
+    Manager resolution the app uses (src.db.get_db_url), and finally the
+    sqlalchemy.url placeholder in alembic.ini. The ini value is only a
+    fallback so `alembic` still runs offline without any environment.
+    """
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
+    try:
+        from src.db import get_db_url
+
+        return get_db_url()
+    except Exception:
+        return config.get_main_option("sqlalchemy.url")
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -38,7 +58,7 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+    url = _database_url()
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -57,8 +77,10 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    configuration = config.get_section(config.config_ini_section, {})
+    configuration["sqlalchemy.url"] = _database_url()
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )

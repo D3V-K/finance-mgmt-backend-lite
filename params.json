@@ -1,0 +1,18 @@
+[
+  {
+    "ParameterKey": "CognitoUserPoolId",
+    "ParameterValue": "ap-northeast-1_vOEFgA0ya"
+  },
+  {
+    "ParameterKey": "CognitoUserPoolClientId",
+    "ParameterValue": "42eipt7dtn3r4vjtoadakr9koh"
+  },
+  {
+    "ParameterKey": "VpcId",
+    "ParameterValue": "vpc-016cffaf93405e615"
+  },
+  {
+    "ParameterKey": "PublicSubnetIds",
+    "ParameterValue": "subnet-0138e0a4ae1e488f5, subnet-0b04deba3e7e357ab"
+  }
+]

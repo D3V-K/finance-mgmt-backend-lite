@@ -2,6 +2,7 @@ version = 0.1
 
 [default.global.parameters]
 stack_name = "finance-mgmt-backend-lite-dev"
+region = "ap-northeast-1"
 
 [default.build.parameters]
 cached = true
@@ -12,8 +13,9 @@ capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 # Creates and reuses a SAM-managed ECR repository for the function image.
 resolve_image_repos = true
-region = "ap-northeast-1"
-parameter_overrides = "Environment=dev"
+parameter_overrides = "Environment=\"prod\" CognitoUserPoolId=\"ap-northeast-1_vOEFgA0ya\" CognitoUserPoolClientId=\"42eipt7dtn3r4vjtoadakr9koh\" VpcId=\"vpc-016cffaf93405e615\" PublicSubnetIds=\"subnet-0138e0a4ae1e488f5,subnet-0b04deba3e7e357ab\" DbName=\"financedb\" DbMaxCapacityAcu=\"1\" CorsAllowOrigins=\"*\" LambdaMemorySize=\"512\" LambdaTimeout=\"30\" LogRetentionInDays=\"14\""
+resolve_s3 = true
+s3_prefix = "finance-mgmt-backend-lite-dev"
 
 [default.local_start_api.parameters]
 env_vars = "env.local.json"

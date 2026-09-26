@@ -22,8 +22,17 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    env:
+      STACK_NAME: finance-mgmt-backend-lite-prod
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -46,3 +55,23 @@ jobs:
               CognitoUserPoolClientId=${{ secrets.COGNITO_CLIENT_ID }} \
               VpcId=${{ secrets.VPC_ID }} \
               PublicSubnetIds=${{ secrets.PUBLIC_SUBNET_IDS }}
+
+      # The Lambda image has no Alembic in it, so migrations run here against
+      # the (publicly reachable) Aurora cluster using the stack's own outputs.
+      # DATABASE_URL is scoped to this step so the password never lands in
+      # $GITHUB_ENV or later steps.
+      - name: Run database migrations
+        run: |
+          export DATABASE_URL="$(python - <<'PY'
+          import boto3, json, os, urllib.parse
+          cf = boto3.client("cloudformation")
+          outputs = {o["OutputKey"]: o["OutputValue"]
+                     for o in cf.describe_stacks(StackName=os.environ["STACK_NAME"])["Stacks"][0]["Outputs"]}
+          creds = json.loads(boto3.client("secretsmanager").get_secret_value(
+              SecretId=outputs["DbSecretArn"])["SecretString"])
+          user = urllib.parse.quote(creds["username"], safe="")
+          pw = urllib.parse.quote(creds["password"], safe="")
+          print(f"postgresql+psycopg2://{user}:{pw}@{outputs['AuroraClusterEndpoint']}:5432/financedb?sslmode=require")
+          PY
+          )"
+          alembic upgrade head

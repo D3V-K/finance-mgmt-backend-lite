@@ -134,7 +134,7 @@ Resources:
     Type: AWS::RDS::DBClusterParameterGroup
     Properties:
       Description: Force TLS on all connections
-      Family: aurora-postgresql16
+      Family: aurora-postgresql17
       Parameters:
         rds.force_ssl: "1"
 
@@ -147,7 +147,7 @@ Resources:
       # Scale-to-zero requires a recent Aurora PostgreSQL minor version.
       # Verify this still meets the current minimum in AWS's docs before
       # deploying — the requirement has moved as the feature has matured.
-      EngineVersion: "16.6"
+      EngineVersion: "17.7"
       DatabaseName: !Ref DbName
       MasterUsername: postgres
       ManageMasterUserPassword: true
@@ -225,27 +225,56 @@ Resources:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
       Events:
-        # Public — used by uptime checks and to warm the function.
+        # Public — used by uptime checks and to warm the function. Path
+        # matches the app's route (APIRouter prefix "/api").
         HealthCheck:
           Type: HttpApi
           Properties:
             ApiId: !Ref HttpApi
-            Path: /health
+            Path: /api/health
             Method: GET
             Auth:
               Authorizer: NONE
-        Root:
+        # Explicit methods rather than ANY: leaving OPTIONS unrouted lets the
+        # HTTP API answer CORS preflight itself, unauthenticated. An ANY route
+        # would instead hand preflight to the Cognito authorizer, which 401s
+        # it (no Authorization header on a preflight) and breaks browser CORS.
+        RootGet:
           Type: HttpApi
           Properties:
             ApiId: !Ref HttpApi
             Path: /
-            Method: ANY
-        Proxy:
+            Method: GET
+        ProxyGet:
           Type: HttpApi
           Properties:
             ApiId: !Ref HttpApi
             Path: /{proxy+}
-            Method: ANY
+            Method: GET
+        ProxyPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: POST
+        ProxyPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: PUT
+        ProxyDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: DELETE
+        ProxyPatch:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: PATCH
       Tags:
         Environment: !Ref Environment
         Application: finance-mgmt-backend-lite
